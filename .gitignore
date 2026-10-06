@@ -1,0 +1,40 @@
+# Python / Django
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.log
+backend/.env
+backend/db.sqlite3
+backend/staticfiles/
+backend/datos_chillamicito.json
+*.pyc
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/*.log
+
+# Editor and local tooling
+.claude/
+.vscode/
+.VSCodeCounter/
+.idea/
+tmp/
+
+# Local data backups
+backup_datos_operativos_*.json
+
+# Generated documents and local drafts
+primer_borrador_Murillo.docx
+primer_borrador_Murillo.pdf
+artillery/reporte-*.html
+artillery/reporte-*.json
+
+# Office temporary files
+~$*
+
+# OS files
+.DS_Store
+Thumbs.db

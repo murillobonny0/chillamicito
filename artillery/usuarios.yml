@@ -1,0 +1,54 @@
+config:
+  target: "http://127.0.0.1:8000/api"
+  phases:
+    - name: "Carga controlada de usuarios"
+      duration: 60
+      arrivalRate: 2
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  - name: "Usuarios: propietario consulta administracion"
+    weight: 70
+    flow:
+      - post:
+          url: "/usuarios/login/"
+          json:
+            username: "Bonny"
+            password: "bonny22"
+          capture:
+            - json: "$.token"
+              as: "token"
+      - get:
+          url: "/usuarios/perfil/"
+          headers:
+            Authorization: "Token {{ token }}"
+      - get:
+          url: "/usuarios/roles/"
+          headers:
+            Authorization: "Token {{ token }}"
+      - get:
+          url: "/usuarios/permisos/"
+          headers:
+            Authorization: "Token {{ token }}"
+      - get:
+          url: "/usuarios/gestion/"
+          headers:
+            Authorization: "Token {{ token }}"
+
+  - name: "Usuarios: acceso no permitido para ayudante"
+    weight: 30
+    flow:
+      - post:
+          url: "/usuarios/login/"
+          json:
+            username: "Maria"
+            password: "maria33"
+          capture:
+            - json: "$.token"
+              as: "token"
+      - get:
+          url: "/usuarios/gestion/"
+          headers:
+            Authorization: "Token {{ token }}"

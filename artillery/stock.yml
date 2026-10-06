@@ -1,0 +1,56 @@
+config:
+  target: "http://127.0.0.1:8000/api"
+  phases:
+    - name: "Carga controlada de stock"
+      duration: 60
+      arrivalRate: 2
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  - name: "Stock: login, consulta operativa y BI"
+    flow:
+      - post:
+          url: "/usuarios/login/"
+          json:
+            username: "Maria"
+            password: "maria33"
+          capture:
+            - json: "$.token"
+              as: "token"
+      - get:
+          url: "/usuarios/stock/catalogos/"
+          headers:
+            Authorization: "Token {{ token }}"
+      - get:
+          url: "/usuarios/stock/insumos/"
+          headers:
+            Authorization: "Token {{ token }}"
+      - get:
+          url: "/usuarios/stock/entradas/"
+          headers:
+            Authorization: "Token {{ token }}"
+      - get:
+          url: "/usuarios/stock/salidas/"
+          headers:
+            Authorization: "Token {{ token }}"
+      - get:
+          url: "/usuarios/stock/notificaciones/"
+          headers:
+            Authorization: "Token {{ token }}"
+
+  - name: "Stock: propietario revisa dashboard BI"
+    flow:
+      - post:
+          url: "/usuarios/login/"
+          json:
+            username: "Bonny"
+            password: "bonny22"
+          capture:
+            - json: "$.token"
+              as: "token"
+      - get:
+          url: "/usuarios/bi/dashboard/"
+          headers:
+            Authorization: "Token {{ token }}"
