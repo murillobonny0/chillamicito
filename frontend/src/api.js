@@ -3,7 +3,7 @@ import axios from 'axios';
 // Cliente HTTP centralizado para consumir la API Django desde React.
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api',
-  timeout: 15000,
+  timeout: 60000,
 });
 
 // Interceptor que agrega el token de autenticacion a cada peticion protegida.

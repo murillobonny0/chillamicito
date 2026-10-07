@@ -1313,12 +1313,11 @@ function App() {
   const loadMermaModule = () => loadStockView('mermas');
 
   const loadBiModule = async (moduleName) => {
-    // Recalcula el Data Mart antes de mostrar reportes o dashboards para evitar datos antiguos.
+    // Muestra el Data Mart ya cargado; el recalculo se ejecuta desde el boton Actualizar.
     setModuleError('');
     setModuleMessage('');
 
     try {
-      await api.post('/usuarios/bi/etl/');
       const dashboardResponse = await api.get('/usuarios/bi/dashboard/');
 
       setBiData(dashboardResponse.data);
@@ -1335,7 +1334,7 @@ function App() {
     setRunningEtl(true);
 
     try {
-      await api.post('/usuarios/bi/etl/');
+      await api.post('/usuarios/bi/etl/', null, { timeout: 180000 });
       const dashboardResponse = await api.get('/usuarios/bi/dashboard/');
 
       setBiData(dashboardResponse.data);
