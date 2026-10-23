@@ -1,5 +1,6 @@
 from django.contrib.auth import authenticate
 from decimal import Decimal
+from datetime import datetime, timedelta
 
 from django.db.models import Count, Q, Sum
 from django.db.models.functions import ExtractHour, ExtractIsoWeekDay, TruncDate, TruncMonth, TruncWeek
@@ -17,6 +18,8 @@ from .feriados_api import obtener_feriados_api
 from .alertas import evaluar_todos_los_stocks, generar_alertas_feriados_proximos
 from .models import (
     Categoria,
+    DetalleEntrada,
+    DetalleSalida,
     Entrada,
     Feriado,
     HechoMovimientoStock,
@@ -392,12 +395,17 @@ class BIDashboardView(APIView):
 
     def get(self, request):
         """Agrupa movimientos de stock en metricas de consumo, costo y rotacion."""
+        if _data_mart_desactualizado():
+            ejecutar_etl_movimientos_stock()
+
         hechos = HechoMovimientoStock.objects.select_related(
             'id_dim_insumo',
             'id_dim_categoria',
             'id_dim_tiempo',
             'id_dim_tipo_movimiento',
         )
+        hechos = _filtrar_hechos_dashboard(hechos, request.query_params)
+        salidas_filtradas = _filtrar_salidas_dashboard(Salida.objects.all(), request.query_params)
         ultimo_etl = RegistroETL.objects.order_by('-fecha_ejecucion').first()
 
         resumen = hechos.aggregate(
@@ -418,7 +426,7 @@ class BIDashboardView(APIView):
             'costo_merma',
         ]:
             resumen[clave] = resumen[clave] or Decimal('0')
-        ventas_resumen = Salida.objects.aggregate(ventas=Sum('total_venta_estimado'))
+        ventas_resumen = salidas_filtradas.aggregate(ventas=Sum('total_venta_estimado'))
         resumen['ventas_estimadas'] = ventas_resumen['ventas'] or Decimal('0')
         resumen['ganancia_estimada'] = resumen['ventas_estimadas'] - (resumen['costo_consumido'] or Decimal('0'))
         resumen['valor_invertido_stock'] = _valor_invertido_stock()
@@ -488,6 +496,18 @@ class BIDashboardView(APIView):
             .annotate(total=Sum('cantidad'), costo=Sum('costo_total'), movimientos=Count('id_hecho_movimiento_stock'))
             .order_by('id_dim_tiempo__anio', 'id_dim_tiempo__mes')
         )
+        merma_mensual_por_insumo = list(
+            hechos.filter(id_dim_tipo_movimiento__nombre='Merma')
+            .values(
+                'id_dim_tiempo__anio',
+                'id_dim_tiempo__mes',
+                'id_dim_tiempo__nombre_mes',
+                'id_dim_insumo__nombre',
+                'id_dim_insumo__unidad_medida',
+            )
+            .annotate(cantidad=Sum('cantidad'), costo=Sum('costo_total'))
+            .order_by('id_dim_tiempo__anio', 'id_dim_tiempo__mes', '-cantidad')
+        )
         gastos_por_insumo = list(
             hechos.filter(id_dim_tipo_movimiento__nombre='Salida')
             .values('id_dim_insumo__nombre')
@@ -517,15 +537,25 @@ class BIDashboardView(APIView):
             )
             .order_by('nombre')
         )
-        demanda_por_dia_franja = _demanda_por_dia_franja()
+        demanda_por_dia_franja = _demanda_por_dia_franja(salidas_filtradas)
         platos_disponibles = _platos_disponibles()
         cobertura_estimada_stock = _cobertura_estimada_stock(hechos)
         tendencia_consumo_semanal = _tendencia_consumo_semanal(hechos)
         merma_por_insumo = _merma_por_insumo(hechos)
-        ganancias_diarias = _ganancias_diarias(hechos)
-        ganancias_semanales = _ganancias_semanales(hechos)
-        ganancias_mensuales = _ganancias_mensuales(hechos)
-        tendencia_ventas_consumo = _tendencia_ventas_consumo(hechos, ganancias_semanales)
+        ganancias_diarias = _ganancias_diarias(hechos, salidas_filtradas)
+        granularidad_tendencia = _granularidad_tendencia(request.query_params)
+        ganancias_semanales = _ganancias_semanales(
+            hechos,
+            salidas_filtradas,
+            granularidad=granularidad_tendencia,
+        )
+        ganancias_mensuales = _ganancias_mensuales(hechos, salidas_filtradas)
+        tendencia_ventas_consumo = _tendencia_ventas_consumo(
+            hechos,
+            ganancias_semanales,
+            granularidad=granularidad_tendencia,
+            salidas_base=salidas_filtradas,
+        )
         kpis_decision = _kpis_decision(
             resumen=resumen,
             stock_actual=stock_actual,
@@ -560,6 +590,7 @@ class BIDashboardView(APIView):
                 'consumo_mensual': consumo_mensual,
                 'compras_mensual': compras_mensual,
                 'merma_mensual': merma_mensual,
+                'merma_mensual_por_insumo': merma_mensual_por_insumo,
                 'gastos_por_insumo': gastos_por_insumo,
                 'rotacion_por_insumo': rotacion_por_insumo,
                 'alertas_compra': alertas_compra,
@@ -579,10 +610,107 @@ class BIDashboardView(APIView):
         )
 
 
-def _demanda_por_dia_franja():
+def _parse_fecha_filtro(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
+    except ValueError:
+        return None
+
+
+def _data_mart_desactualizado():
+    esperados = {
+        HechoMovimientoStock.Origen.ENTRADA: DetalleEntrada.objects.count(),
+        HechoMovimientoStock.Origen.SALIDA: DetalleSalida.objects.count(),
+        HechoMovimientoStock.Origen.MERMA: Merma.objects.count(),
+    }
+    actuales = {
+        item['origen']: item['total']
+        for item in HechoMovimientoStock.objects.values('origen').annotate(total=Count('id_hecho_movimiento_stock'))
+    }
+    return any(actuales.get(origen, 0) != total for origen, total in esperados.items())
+
+
+def _rango_periodo(periodo):
+    hoy = timezone.localdate()
+    if periodo == 'dia':
+        return hoy, hoy
+    if periodo == 'semana':
+        inicio = hoy - timedelta(days=hoy.isoweekday() - 1)
+        return inicio, inicio + timedelta(days=6)
+    if periodo == 'mes':
+        inicio = hoy.replace(day=1)
+        siguiente = (inicio.replace(day=28) + timedelta(days=4)).replace(day=1)
+        return inicio, siguiente - timedelta(days=1)
+    if periodo == 'trimestre':
+        primer_mes = ((hoy.month - 1) // 3) * 3 + 1
+        inicio = hoy.replace(month=primer_mes, day=1)
+        if primer_mes >= 10:
+            siguiente = hoy.replace(year=hoy.year + 1, month=1, day=1)
+        else:
+            siguiente = hoy.replace(month=primer_mes + 3, day=1)
+        return inicio, siguiente - timedelta(days=1)
+    return None, None
+
+
+def _fechas_dashboard(params):
+    inicio = _parse_fecha_filtro(params.get('fecha_inicio'))
+    fin = _parse_fecha_filtro(params.get('fecha_fin'))
+    if not inicio and not fin:
+        inicio, fin = _rango_periodo(params.get('periodo'))
+    return inicio, fin
+
+
+def _granularidad_tendencia(params):
+    inicio, fin = _fechas_dashboard(params)
+    if params.get('periodo') == 'dia':
+        return 'dia'
+    if inicio and fin and (fin - inicio).days <= 31:
+        return 'dia'
+    if (inicio and not fin) or (fin and not inicio):
+        return 'dia'
+    return 'semana'
+
+
+def _filtrar_hechos_dashboard(hechos, params):
+    inicio, fin = _fechas_dashboard(params)
+    if inicio:
+        hechos = hechos.filter(id_dim_tiempo__fecha__gte=inicio)
+    if fin:
+        hechos = hechos.filter(id_dim_tiempo__fecha__lte=fin)
+    if params.get('insumo'):
+        hechos = hechos.filter(id_dim_insumo__nombre__iexact=params['insumo'])
+    if params.get('plato'):
+        hechos = hechos.filter(plato__iexact=params['plato'])
+    if params.get('tipo_dia') == 'fin_semana':
+        hechos = hechos.filter(id_dim_tiempo__dia_semana__in=[6, 7])
+    elif params.get('tipo_dia') == 'entre_semana':
+        hechos = hechos.filter(id_dim_tiempo__dia_semana__in=[1, 2, 3, 4, 5])
+    return hechos
+
+
+def _filtrar_salidas_dashboard(salidas, params):
+    inicio, fin = _fechas_dashboard(params)
+    if inicio:
+        salidas = salidas.filter(fecha_salida__date__gte=inicio)
+    if fin:
+        salidas = salidas.filter(fecha_salida__date__lte=fin)
+    if params.get('plato'):
+        salidas = salidas.filter(plato__iexact=params['plato'])
+    if params.get('insumo'):
+        salidas = salidas.filter(detalles__id_insumo__nombre__iexact=params['insumo']).distinct()
+    if params.get('tipo_dia') == 'fin_semana':
+        salidas = salidas.annotate(dia_semana=ExtractIsoWeekDay('fecha_salida')).filter(dia_semana__in=[6, 7])
+    elif params.get('tipo_dia') == 'entre_semana':
+        salidas = salidas.annotate(dia_semana=ExtractIsoWeekDay('fecha_salida')).filter(dia_semana__in=[1, 2, 3, 4, 5])
+    return salidas
+
+
+def _demanda_por_dia_franja(salidas_base=None):
     """Calcula promedio historico de platos por dia de semana y franja horaria."""
     salidas = (
-        Salida.objects.annotate(
+        (salidas_base if salidas_base is not None else Salida.objects.all()).annotate(
             fecha=TruncDate('fecha_salida'),
             hora=ExtractHour('fecha_salida'),
             dia_semana=ExtractIsoWeekDay('fecha_salida'),
@@ -725,18 +853,43 @@ def _tendencia_consumo_semanal(hechos):
     return resultado
 
 
-def _tendencia_ventas_consumo(hechos, ganancias_semanales):
-    """Cruza ventas operativas con consumo del Data Mart para ver demanda real."""
-    consumos = {
-        _fecha_key(item['semana']): {
-            'consumo': item['consumo'] or Decimal('0'),
-            'costo': item['costo'] or Decimal('0'),
+def _tendencia_ventas_consumo(hechos, ganancias_semanales, granularidad='semana', salidas_base=None):
+    """Cruza ventas y consumo desde las mismas salidas filtradas para ver demanda real."""
+    trunc_periodo = TruncDate if granularidad == 'dia' else TruncWeek
+    if salidas_base is not None:
+        salida_ids = salidas_base.values('id_salida')
+        consumos_query = (
+            DetalleSalida.objects
+            .filter(id_salida__in=salida_ids)
+            .annotate(semana=trunc_periodo('id_salida__fecha_salida'))
+            .values('semana')
+            .annotate(consumo=Sum('cantidad'))
+        )
+        costos = {
+            _fecha_key(item['semana']): item['costo'] or Decimal('0')
+            for item in hechos.filter(id_dim_tipo_movimiento__nombre='Salida')
+            .annotate(semana=trunc_periodo('id_dim_tiempo__fecha'))
+            .values('semana')
+            .annotate(costo=Sum('costo_total'))
         }
-        for item in hechos.filter(id_dim_tipo_movimiento__nombre='Salida')
-        .annotate(semana=TruncWeek('id_dim_tiempo__fecha'))
-        .values('semana')
-        .annotate(consumo=Sum('cantidad'), costo=Sum('costo_total'))
-    }
+        consumos = {
+            _fecha_key(item['semana']): {
+                'consumo': item['consumo'] or Decimal('0'),
+                'costo': costos.get(_fecha_key(item['semana']), Decimal('0')),
+            }
+            for item in consumos_query
+        }
+    else:
+        consumos = {
+            _fecha_key(item['semana']): {
+                'consumo': item['consumo'] or Decimal('0'),
+                'costo': item['costo'] or Decimal('0'),
+            }
+            for item in hechos.filter(id_dim_tipo_movimiento__nombre='Salida')
+            .annotate(semana=trunc_periodo('id_dim_tiempo__fecha'))
+            .values('semana')
+            .annotate(consumo=Sum('cantidad'), costo=Sum('costo_total'))
+        }
     resultado = []
     ventas_anterior = None
     consumo_anterior = None
@@ -772,6 +925,7 @@ def _tendencia_ventas_consumo(hechos, ganancias_semanales):
                 'variacion_ventas': variacion_ventas,
                 'variacion_consumo': variacion_consumo,
                 'estado_tendencia': estado,
+                'granularidad': granularidad,
             }
         )
         ventas_anterior = ventas
@@ -868,10 +1022,29 @@ def _kpis_decision(
     ultima_tendencia = tendencia_consumo_semanal[-1] if tendencia_consumo_semanal else None
     menor_cobertura = min(cobertura_estimada_stock, key=lambda item: item['cobertura_dias'], default=None)
     mayor_merma = merma_por_insumo[0] if merma_por_insumo else None
+    total_merma = resumen.get('total_mermas', Decimal('0')) or Decimal('0')
+    total_consumo = resumen.get('total_salidas', Decimal('0')) or Decimal('0')
+    porcentaje_merma = (total_merma / total_consumo * Decimal('100')) if total_consumo else Decimal('0')
+    if porcentaje_merma > Decimal('5'):
+        estado_merma = 'critico'
+        decision_merma = 'La merma es alta; revisar recepcion, manipulacion y conservacion de los insumos con mayor perdida.'
+    elif porcentaje_merma > Decimal('2'):
+        estado_merma = 'preventivo'
+        decision_merma = 'La merma es media; controlar la recepcion y observar si se repite en los mismos insumos.'
+    else:
+        estado_merma = 'normal'
+        decision_merma = 'La merma esta en un rango bajo para el periodo filtrado.'
     meta_ventas = _meta_ventas_mensual(ganancias_mensuales)
+    nivel_ventas = _nivel_ventas_mensual(ganancias_mensuales)
     mes_actual = ganancias_mensuales[-1] if ganancias_mensuales else {}
     ventas_actuales = mes_actual.get('ventas', Decimal('0')) or Decimal('0')
     cumplimiento_meta = (ventas_actuales / meta_ventas * Decimal('100')) if meta_ventas else Decimal('0')
+    if nivel_ventas == 'alto':
+        decision_meta = 'El ultimo mes fue alto; mantener stock y preparacion para los horarios de mayor demanda.'
+    elif nivel_ventas == 'bajo':
+        decision_meta = 'El ultimo mes fue bajo; revisar platos con menor salida, horarios y disponibilidad de insumos.'
+    else:
+        decision_meta = 'El ultimo mes fue normal; sostener compras y preparacion segun la demanda registrada.'
 
     return [
         {
@@ -943,14 +1116,17 @@ def _kpis_decision(
             'codigo': 'merma_insumo',
             'nombre': 'Merma por insumo',
             'pregunta': 'Donde se estan generando perdidas?',
-            'valor': resumen.get('total_mermas', Decimal('0')) or Decimal('0'),
+            'valor': total_merma,
             'unidad': 'kg',
             'lectura': (
-                f"{mayor_merma['id_dim_insumo__nombre']} concentra la mayor merma."
+                f"{mayor_merma['id_dim_insumo__nombre']} concentra la mayor merma. "
+                f"La merma representa {porcentaje_merma.quantize(Decimal('0.01'))}% del consumo."
                 if mayor_merma else 'No existen registros de merma en el periodo.'
             ),
-            'decision': 'Revisar almacenamiento, vencimiento y manipulacion del insumo con mayor merma.',
-            'estado': 'preventivo' if mayor_merma else 'normal',
+            'decision': decision_merma,
+            'estado': estado_merma if mayor_merma else 'normal',
+            'porcentaje_consumo': porcentaje_merma,
+            'costo_estimado': resumen.get('costo_merma', Decimal('0')) or Decimal('0'),
         },
         {
             'codigo': 'meta_ventas',
@@ -959,11 +1135,12 @@ def _kpis_decision(
             'valor': cumplimiento_meta,
             'unidad': '%',
             'lectura': (
-                f"Compara las ventas del ultimo mes registrado con una meta estimada de "
-                f"Bs {meta_ventas.quantize(Decimal('0.01'))}."
+                f"El ultimo mes fue {nivel_ventas}; ventas Bs {ventas_actuales.quantize(Decimal('0.01'))} "
+                f"contra meta estimada Bs {meta_ventas.quantize(Decimal('0.01'))}."
             ),
-            'decision': 'Si no llega al 100%, revisar horarios de mayor demanda, platos disponibles y stock critico.',
-            'estado': 'normal' if cumplimiento_meta >= 100 else 'preventivo',
+            'decision': decision_meta,
+            'estado': 'normal' if cumplimiento_meta >= 100 else ('critico' if nivel_ventas == 'bajo' else 'preventivo'),
+            'nivel_ventas': nivel_ventas,
         },
     ]
 
@@ -973,6 +1150,21 @@ def _meta_ventas_mensual(ganancias_mensuales):
     if not ventas:
         return Decimal('0')
     return (sum(ventas, Decimal('0')) / len(ventas)) * META_VENTAS_FACTOR
+
+
+def _nivel_ventas_mensual(ganancias_mensuales):
+    ventas = [item['ventas'] or Decimal('0') for item in ganancias_mensuales if item.get('ventas')]
+    if len(ventas) < 2:
+        return 'normal'
+    promedio = sum(ventas, Decimal('0')) / len(ventas)
+    ultimo_mes = ventas[-1]
+    if promedio <= 0:
+        return 'normal'
+    if ultimo_mes < promedio * Decimal('0.85'):
+        return 'bajo'
+    if ultimo_mes > promedio * Decimal('1.15'):
+        return 'alto'
+    return 'normal'
 
 
 def _analisis_complementarios(
@@ -1109,7 +1301,7 @@ def _lectura_abastecimiento(entradas_vs_salidas, tendencia_costos):
     }
 
 
-def _ganancias_diarias(hechos):
+def _ganancias_diarias(hechos, salidas_base=None):
     """Calcula ventas, costo consumido y ganancia por dia sin duplicar ventas por detalle."""
     costos = {
         _fecha_key(item['id_dim_tiempo__fecha']): item['costo'] or Decimal('0')
@@ -1118,7 +1310,8 @@ def _ganancias_diarias(hechos):
         .annotate(costo=Sum('costo_total'))
     }
     ventas = (
-        Salida.objects.annotate(fecha=TruncDate('fecha_salida'))
+        (salidas_base if salidas_base is not None else Salida.objects.all())
+        .annotate(fecha=TruncDate('fecha_salida'))
         .values('fecha')
         .annotate(ventas=Sum('total_venta_estimado'), platos=Sum('cantidad_platos'))
         .order_by('fecha')
@@ -1136,17 +1329,19 @@ def _ganancias_diarias(hechos):
     ]
 
 
-def _ganancias_semanales(hechos):
-    """Calcula utilidad semanal comparando ventas estimadas contra costo consumido."""
+def _ganancias_semanales(hechos, salidas_base=None, granularidad='semana'):
+    """Calcula utilidad por dia o semana comparando ventas estimadas contra costo consumido."""
+    trunc_periodo = TruncDate if granularidad == 'dia' else TruncWeek
     costos = {
         _fecha_key(item['semana']): item['costo'] or Decimal('0')
         for item in hechos.filter(id_dim_tipo_movimiento__nombre='Salida')
-        .annotate(semana=TruncWeek('id_dim_tiempo__fecha'))
+        .annotate(semana=trunc_periodo('id_dim_tiempo__fecha'))
         .values('semana')
         .annotate(costo=Sum('costo_total'))
     }
     ventas = (
-        Salida.objects.annotate(semana=TruncWeek('fecha_salida'))
+        (salidas_base if salidas_base is not None else Salida.objects.all())
+        .annotate(semana=trunc_periodo('fecha_salida'))
         .values('semana')
         .annotate(ventas=Sum('total_venta_estimado'), platos=Sum('cantidad_platos'))
         .order_by('semana')
@@ -1159,12 +1354,13 @@ def _ganancias_semanales(hechos):
             'costo': costos.get(_fecha_key(item['semana']), Decimal('0')),
             'ganancia': (item['ventas'] or Decimal('0')) - costos.get(_fecha_key(item['semana']), Decimal('0')),
             'platos': item['platos'] or Decimal('0'),
+            'granularidad': granularidad,
         }
         for item in ventas
     ]
 
 
-def _ganancias_mensuales(hechos):
+def _ganancias_mensuales(hechos, salidas_base=None):
     """Calcula utilidad mensual usando ventas operativas y costos del Data Mart."""
     costos = {
         _fecha_key(item['mes']): item['costo'] or Decimal('0')
@@ -1174,7 +1370,8 @@ def _ganancias_mensuales(hechos):
         .annotate(costo=Sum('costo_total'))
     }
     ventas = (
-        Salida.objects.annotate(mes=TruncMonth('fecha_salida'))
+        (salidas_base if salidas_base is not None else Salida.objects.all())
+        .annotate(mes=TruncMonth('fecha_salida'))
         .values('mes')
         .annotate(ventas=Sum('total_venta_estimado'), platos=Sum('cantidad_platos'))
         .order_by('mes')

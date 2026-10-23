@@ -111,6 +111,36 @@ export function createMonthlyReportPdf(report, { formatMoney, formatCantidad, ge
     y += height;
   });
 
+  if (report.mermaDetalle?.length) {
+    y += 9;
+    if (y + 24 > bottom) {
+      doc.addPage();
+      y = header(true);
+    }
+    text('Merma por insumo', margin, y, 12, colors.ink, true);
+    y += 5;
+    doc.setFillColor(colors.red);
+    doc.rect(margin, y, width, 9, 'F');
+    text('INSUMO', margin + 4, y + 6, 8, colors.white, true);
+    text('KG', margin + 118, y + 6, 8, colors.white, true, { align: 'right' });
+    text('PÉRDIDA', margin + width - 4, y + 6, 8, colors.white, true, { align: 'right' });
+    y += 9;
+
+    report.mermaDetalle.forEach((item, index) => {
+      const height = 9;
+      if (y + height > bottom) {
+        doc.addPage();
+        y = header(true);
+      }
+      doc.setFillColor(index % 2 ? colors.white : colors.pale);
+      doc.rect(margin, y, width, height, 'F');
+      text(item.insumo, margin + 4, y + 6, 8, colors.ink);
+      text(`${formatCantidad(item.cantidad)} ${item.unidad || 'kg'}`, margin + 118, y + 6, 8, colors.ink, false, { align: 'right' });
+      text(formatMoney(item.costo), margin + width - 4, y + 6, 8, colors.ink, false, { align: 'right' });
+      y += height;
+    });
+  }
+
   const pages = doc.getNumberOfPages();
   for (let page = 1; page <= pages; page++) {
     doc.setPage(page);

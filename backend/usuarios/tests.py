@@ -84,6 +84,71 @@ class MovimientosTests(TestCase):
         del payload['id_operacion']
         self.assertEqual(self.post('entradas', payload).status_code, 201)
 
+    def test_entrada_con_merma_descuenta_stock_y_registra_perdida(self):
+        payload = self.payload('entradas')
+        payload['detalles'][0].update(cantidad=2, costo_unitario=40)
+        payload['mermas'] = [
+            {
+                'id_insumo': self.insumo.pk,
+                'cantidad': 1,
+                'observacion': 'Producto danado al recibir',
+            }
+        ]
+        response = self.post('entradas', payload)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.cantidad_actual, Decimal('11'))
+        merma = Merma.objects.get()
+        self.assertEqual(merma.motivo, 'Recepción')
+        self.assertEqual(merma.cantidad, Decimal('1.000'))
+
+    def test_entrada_rechaza_merma_mayor_a_cantidad_recibida(self):
+        payload = self.payload('entradas')
+        payload['detalles'][0].update(cantidad=2, costo_unitario=40)
+        payload['mermas'] = [
+            {
+                'id_insumo': self.insumo.pk,
+                'cantidad': 3,
+                'observacion': 'Producto danado al recibir',
+            }
+        ]
+        self.assertEqual(self.post('entradas', payload).status_code, 400)
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.cantidad_actual, Decimal('10'))
+
+    def test_dashboard_actualiza_data_mart_y_reporta_merma_de_entrada(self):
+        self.stock.cantidad_actual = 0
+        self.stock.save()
+
+        entrada_previa = self.payload('entradas')
+        entrada_previa['id_operacion'] = 'entrada-previa-test'
+        entrada_previa['detalles'][0].update(cantidad=10, costo_unitario=5)
+        self.assertEqual(self.post('entradas', entrada_previa).status_code, 201)
+
+        payload = self.payload('entradas')
+        payload['id_operacion'] = 'entrada-merma-recepcion-test'
+        payload['detalles'][0].update(cantidad=13, costo_unitario=25)
+        payload['mermas'] = [
+            {
+                'id_insumo': self.insumo.pk,
+                'cantidad': 4,
+                'observacion': 'Merma registrada al recibir',
+            }
+        ]
+        self.assertEqual(self.post('entradas', payload).status_code, 201)
+
+        rol_propietario, _ = Rol.objects.get_or_create(nombre_rol='propietario')
+        propietario = Usuario.objects.create_user(username='propietario-bi-prueba', id_rol=rol_propietario)
+        self.client.force_authenticate(propietario)
+        response = self.client.get('/api/usuarios/bi/dashboard/')
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(HechoMovimientoStock.objects.filter(origen='merma').count(), 1)
+        self.assertEqual(Decimal(str(response.data['resumen']['total_mermas'])), Decimal('4.000'))
+        self.assertEqual(Decimal(str(response.data['resumen']['costo_merma'])), Decimal('100.000'))
+        self.assertEqual(response.data['merma_mensual'][0]['total'], Decimal('4.000'))
+        self.assertEqual(response.data['merma_mensual'][0]['costo'], Decimal('100.000'))
+
     def test_websocket_solo_anuncia_nuevos_movimientos(self):
         with patch('usuarios.serializers.enviar_movimiento_stock') as notify:
             with self.captureOnCommitCallbacks(execute=True):

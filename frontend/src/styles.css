@@ -789,6 +789,12 @@ h3 {
   font-size: 1.05rem;
 }
 
+.monthly-metrics small {
+  color: #67594f;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
 .report-filter {
   align-items: end;
   display: grid;

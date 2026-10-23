@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createOperation, createStockClient, normalizeLegacySnapshot, projectSnapshot } from '../src/stockOffline.js';
+import { createAuthSession } from '../src/authSession.js';
 
 const user = { id_usuario: 7, username: 'operador', rol: 'ayudante_cocina' };
 const snapshot = () => ({ insumos: [{ id_insumo: 1, nombre: 'Papa', cantidad_actual: 10, stock_minimo: 5 }], entradas: [], salidas: [], mermas: [] });
@@ -9,7 +10,7 @@ const payload = (cantidad = 2) => ({ detalles: [{ id_insumo: 1, cantidad, costo_
 function setup() {
   let token = 'token';
   Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { onLine: true } });
-  globalThis.localStorage = { getItem: () => token };
+  globalThis.sessionStorage = { getItem: () => token };
   let data = snapshot();
   const queue = new Map();
   const accepted = new Map();
@@ -143,6 +144,57 @@ test('no envia con la credencial de otra sesion', async () => {
   env.reconnect();
   await env.client.sync(user, 'token');
   assert.equal(env.requests(), 0);
+});
+
+test('dos usuarios sincronizan sus pendientes con su propia credencial y cache', async () => {
+  setup();
+  navigator.onLine = false;
+  const otherUser = { ...user, id_usuario: 8, username: 'otro-operador' };
+  const snapshots = new Map([[7, { ...snapshot(), offlineVersion: 2 }], [8, { ...snapshot(), offlineVersion: 2 }]]);
+  const operations = new Map();
+  const storage = {
+    getSnapshot: async (id) => structuredClone(snapshots.get(id)),
+    listOperations: async (id) => structuredClone([...operations.values()].filter((item) => item.userId === String(id))),
+    addOperation: async (item) => { operations.set(item.id, structuredClone(item)); },
+    reconcileSnapshot: async (id, data, confirmed) => {
+      snapshots.set(id, structuredClone(data));
+      confirmed.forEach((item) => operations.delete(item.id));
+    },
+  };
+  const sessions = [7, 8].map((id, index) => {
+    const values = new Map();
+    const session = createAuthSession({
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, value),
+      removeItem: (key) => values.delete(key),
+    });
+    session.save(`token-${id}`, index === 0 ? user : otherUser);
+    return session;
+  });
+  const sent = [];
+  const api = {
+    post: async (_endpoint, body, config) => { sent.push({ id: body.id_operacion, token: config.headers.Authorization }); },
+    get: async (endpoint) => ({ data: endpoint.endsWith('/insumos/') ? snapshot().insumos : [] }),
+  };
+  const first = createStockClient(api, storage, sessions[0]);
+  const second = createStockClient(api, storage, sessions[1]);
+  await first.save(user, 'token-7', 'entrada', payload(1));
+  await second.save(otherUser, 'token-8', 'salida', payload(2));
+  assert.equal((await first.cached(user)).data.insumos[0].cantidad_actual, 11);
+  assert.equal((await second.cached(otherUser)).data.insumos[0].cantidad_actual, 8);
+
+  sessions[0].clear();
+  navigator.onLine = true;
+  await Promise.all([first.sync(user, 'token-7'), second.sync(otherUser, 'token-8')]);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].token, 'Token token-8');
+  assert.equal((await storage.listOperations(user.id_usuario)).length, 1);
+  assert.equal((await storage.listOperations(otherUser.id_usuario)).length, 0);
+
+  sessions[0].save('token-7', user);
+  await first.sync(user, 'token-7');
+  assert.equal(sent[1].token, 'Token token-7');
+  assert.equal(operations.size, 0);
 });
 
 test('no confirma guardado ni envia cuando falla almacenamiento', async () => {

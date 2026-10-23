@@ -2,6 +2,7 @@
 import ReactECharts from 'echarts-for-react';
 import { createMonthlyReportPdf, monthlyReportFilename } from './monthlyReportPdf';
 import api from './api';
+import { authSession } from './authSession';
 import * as offlineStore from './offlineStore';
 import { createStockClient, errorMessage, isNetworkFailure } from './stockOffline';
 
@@ -32,6 +33,9 @@ const initialEntradaForm = {
   cantidad_compra: 1,
   costo_compra: 0,
   observacion: '',
+  hubo_merma: '',
+  merma_cantidad: '',
+  merma_observacion: '',
 };
 
 // Estado inicial para modificar el nivel minimo usado por alertas, salidas y BI.
@@ -55,6 +59,27 @@ const initialMermaForm = {
   cantidad: 1,
   motivo: 'Recorte',
   observacion: '',
+};
+
+const initialDemandaFilters = {
+  plato: '',
+  tipo_dia: 'todos',
+};
+
+const initialTendenciaFilters = {
+  fecha_inicio: '',
+  fecha_fin: '',
+  periodo: '',
+  plato: '',
+  tipo_dia: 'todos',
+};
+
+const initialMermaFilters = {
+  fecha_inicio: '',
+  fecha_fin: '',
+  periodo: '',
+  insumo: '',
+  tipo_dia: 'todos',
 };
 
 // Estructura inicial del dashboard BI antes de cargar datos desde Django.
@@ -84,15 +109,6 @@ const initialBiData = {
   ganancias_mensuales: [],
   kpis_decision: [],
   analisis_complementarios: {},
-};
-
-const readOfflineUser = () => {
-  try {
-    const value = localStorage.getItem('chillamicito:offline-user');
-    return value ? JSON.parse(value) : null;
-  } catch {
-    return null;
-  }
 };
 
 // Insumos base que se usan para calcular disponibilidad de produccion.
@@ -382,7 +398,7 @@ const dashboards = {
   ayudante_cocina: {
     title: 'Ayudante de cocina',
     subtitle: '',
-    actions: ['Registrar entrada', 'Registrar salida', 'Registrar merma', 'Consultar stock', 'Revisar disponibilidad'],
+    actions: ['Registrar entrada', 'Registrar salida', 'Consultar stock', 'Revisar disponibilidad'],
   },
 };
 
@@ -406,6 +422,13 @@ function App() {
   const [stockMinimoForm, setStockMinimoForm] = useState(initialStockMinimoForm);
   const [salidaForm, setSalidaForm] = useState(initialSalidaForm);
   const [mermaForm, setMermaForm] = useState(initialMermaForm);
+  const [demandaFilters, setDemandaFilters] = useState(initialDemandaFilters);
+  const [tendenciaFilters, setTendenciaFilters] = useState(initialTendenciaFilters);
+  const [mermaFilters, setMermaFilters] = useState(initialMermaFilters);
+  const [demandaIndicatorData, setDemandaIndicatorData] = useState(null);
+  const [tendenciaIndicatorData, setTendenciaIndicatorData] = useState(null);
+  const [mermaIndicatorData, setMermaIndicatorData] = useState(null);
+  const [metaVentasTemporal, setMetaVentasTemporal] = useState('');
   const [selectedDemandIndex, setSelectedDemandIndex] = useState(0);
   const [historialVentaFiltro, setHistorialVentaFiltro] = useState('');
   const [activeModule, setActiveModule] = useState('');
@@ -540,12 +563,15 @@ function App() {
     () => Math.max(...(biData.consumo_por_insumo || []).map((item) => Number(item.total || 0)), 1),
     [biData],
   );
+  const demandaDashboardData = demandaIndicatorData || biData;
+  const tendenciaDashboardData = tendenciaIndicatorData || biData;
+  const mermaDashboardData = mermaIndicatorData || biData;
   const demandaFuerte = useMemo(
     // Ordena la demanda por dia/franja para mostrar donde se concentra la atencion.
-    () => [...(biData.demanda_por_dia_franja || [])]
+    () => [...(demandaDashboardData.demanda_por_dia_franja || [])]
       .sort((a, b) => Number(b.promedio_platos || 0) - Number(a.promedio_platos || 0))
       .slice(0, 10),
-    [biData],
+    [demandaDashboardData],
   );
   const coberturaCritica = useMemo(
     // Prioriza los insumos con menor cantidad de días estimados de cobertura.
@@ -556,8 +582,8 @@ function App() {
   );
   const tendenciaVentasConsumo = useMemo(
     // Cruza ventas estimadas con consumo en kg para leer variacion real de demanda.
-    () => [...(biData.tendencia_ventas_consumo || [])],
-    [biData],
+    () => [...(tendenciaDashboardData.tendencia_ventas_consumo || [])],
+    [tendenciaDashboardData],
   );
   const ultimaTendencia = tendenciaVentasConsumo.at(-1);
   const mesesReporte = useMemo(
@@ -582,6 +608,7 @@ function App() {
           utilidadNeta: 0,
           platos: 0,
           movimientos: 0,
+          mermaDetalle: [],
         };
         meses.set(key, current);
         return current;
@@ -621,6 +648,21 @@ function App() {
         mes.mermaKg = Number(item.total || 0);
         mes.costoMerma = Number(item.costo || 0);
         mes.movimientos += Number(item.movimientos || 0);
+      });
+
+      (biData.merma_mensual_por_insumo || []).forEach((item) => {
+        const month = Number(item.id_dim_tiempo__mes || 0);
+        const year = Number(item.id_dim_tiempo__anio || new Date().getFullYear());
+        if (!month) {
+          return;
+        }
+        const mes = ensureMes(year, month, item.id_dim_tiempo__nombre_mes);
+        mes.mermaDetalle.push({
+          insumo: item.id_dim_insumo__nombre,
+          unidad: item.id_dim_insumo__unidad_medida,
+          cantidad: Number(item.cantidad || 0),
+          costo: Number(item.costo || 0),
+        });
       });
 
       (biData.ganancias_mensuales || []).forEach((item) => {
@@ -697,17 +739,28 @@ function App() {
         return [];
       }
 
-      return (biData.demanda_por_dia_franja || [])
+      return (demandaDashboardData.demanda_por_dia_franja || [])
         .filter((item) =>
           item.nombre_dia === demandaPico.nombre_dia
           && item.franja_horaria === demandaPico.franja_horaria,
         )
         .sort((a, b) => Number(b.promedio_platos || 0) - Number(a.promedio_platos || 0));
     },
-    [biData.demanda_por_dia_franja, demandaPico],
+    [demandaDashboardData.demanda_por_dia_franja, demandaPico],
   );
-  const totalMermaKg = Number(biData.resumen?.total_mermas || 0);
-  const totalMermaCosto = Number(biData.resumen?.costo_merma || 0);
+  const totalMermaKg = Number(mermaDashboardData.resumen?.total_mermas || 0);
+  const totalMermaCosto = Number(mermaDashboardData.resumen?.costo_merma || 0);
+  const metaTemporalNumero = Number(metaVentasTemporal || 0);
+  const ventasUltimoMes = Number((biData.ganancias_mensuales || []).at(-1)?.ventas || 0);
+  const cumplimientoMetaTemporal = metaTemporalNumero > 0 ? (ventasUltimoMes / metaTemporalNumero) * 100 : null;
+  const faltanteMetaTemporal = metaTemporalNumero > 0 ? Math.max(metaTemporalNumero - ventasUltimoMes, 0) : 0;
+  const estadoMetaTemporal = cumplimientoMetaTemporal === null
+    ? 'sin referencia'
+    : cumplimientoMetaTemporal >= 90
+      ? 'normal'
+      : cumplimientoMetaTemporal >= 70
+        ? 'preventivo'
+        : 'critico';
   const kpisDecision = biData.kpis_decision || [];
   const kpiStock = kpisDecision.find((item) => item.codigo === 'stock_minimo');
   const kpiPlatos = kpisDecision.find((item) => item.codigo === 'platos_disponibles');
@@ -715,6 +768,8 @@ function App() {
   const kpiTendencia = kpisDecision.find((item) => item.codigo === 'tendencia_ventas_consumo');
   const kpiCobertura = kpisDecision.find((item) => item.codigo === 'cobertura_riesgo');
   const kpiMerma = kpisDecision.find((item) => item.codigo === 'merma_insumo');
+  const kpiMermaIndicador = (mermaDashboardData.kpis_decision || []).find((item) => item.codigo === 'merma_insumo')
+    || kpiMerma;
   const kpiMeta = kpisDecision.find((item) => item.codigo === 'meta_ventas');
   const analisisComplementarios = biData.analisis_complementarios || {};
   const decisionKpis = useMemo(
@@ -877,10 +932,12 @@ function App() {
     tooltip: {
       ...tooltipStyle,
       trigger: 'axis',
-      formatter: (items) => items.map((item) => {
-        const value = item.seriesName === 'Ventas' ? formatMoney(item.value) : `${formatCantidad(item.value)} kg`;
-        return `${item.marker}${item.seriesName}: ${value}`;
-      }).join('<br/>'),
+      formatter: (items) => items
+        .filter((item) => item.value !== null && item.value !== undefined)
+        .map((item) => {
+          const value = item.seriesName === 'Ventas' ? formatMoney(item.value) : `${formatCantidad(item.value)} kg`;
+          return `${item.marker}${item.seriesName}: ${value}`;
+        }).join('<br/>'),
     },
     legend: {
       top: 0,
@@ -889,7 +946,8 @@ function App() {
     grid: { ...gridStyle, left: 58, right: 58 },
     xAxis: {
       type: 'category',
-      data: tendenciaVentasConsumo.map((item) => new Date(item.semana).toLocaleDateString('es-BO')),
+      boundaryGap: true,
+      data: tendenciaVentasConsumo.map((item) => formatDateOnly(item.semana)),
       axisLabel: { ...chartTextStyle, rotate: 25 },
     },
     yAxis: [
@@ -912,15 +970,20 @@ function App() {
         name: 'Ventas',
         type: 'line',
         smooth: true,
-        symbolSize: 8,
+        symbolSize: 9,
+        lineStyle: { width: 3 },
         data: tendenciaVentasConsumo.map((item) => Number(item.ventas || 0)),
-        areaStyle: { opacity: 0.08 },
       },
       {
         name: 'Consumo',
         type: 'bar',
         yAxisIndex: 1,
-        data: tendenciaVentasConsumo.map((item) => Number(item.consumo || 0)),
+        barMaxWidth: 74,
+        barMinWidth: 28,
+        data: tendenciaVentasConsumo.map((item) => {
+          const consumo = Number(item.consumo || 0);
+          return consumo > 0 ? consumo : null;
+        }),
         itemStyle: { borderRadius: [6, 6, 0, 0] },
       },
     ],
@@ -961,33 +1024,48 @@ function App() {
     }],
   }), [coberturaCritica]);
   const mermaOption = useMemo(() => {
-    const mermaData = (biData.merma_por_insumo?.length ? biData.merma_por_insumo : [{ id_dim_insumo__nombre: 'Sin merma', cantidad: 0 }])
-      .map((item) => ({ name: item.id_dim_insumo__nombre, value: Number(item.cantidad || 0) }));
+    const mermaData = (mermaDashboardData.merma_por_insumo?.length
+      ? mermaDashboardData.merma_por_insumo
+      : [{ id_dim_insumo__nombre: 'Sin merma', cantidad: 0, costo: 0 }]);
 
     return {
-      color: businessChartPalette,
+      color: ['#c3423f', '#d59b2d'],
       tooltip: {
         ...tooltipStyle,
-        trigger: 'item',
-        formatter: '{b}<br/>{c} kg ({d}%)',
+        trigger: 'axis',
+        axisPointer: { type: 'shadow' },
+        formatter: (items) => items.map((item) =>
+          `${item.marker}${item.seriesName}: ${item.seriesName === 'Perdida estimada' ? formatMoney(item.value) : `${formatCantidad(item.value)} kg`}`,
+        ).join('<br/>'),
       },
-      legend: {
-        orient: 'vertical',
-        right: 8,
-        top: 16,
-        textStyle: chartTextStyle,
+      legend: { top: 0, textStyle: chartTextStyle },
+      grid: { left: 82, right: 24, top: 42, bottom: 32 },
+      xAxis: {
+        type: 'value',
+        axisLabel: chartTextStyle,
+        splitLine: { lineStyle: { color: '#e8efeb' } },
       },
-      series: [{
-        name: 'Merma',
-        type: 'pie',
-        radius: ['48%', '72%'],
-        center: ['38%', '54%'],
-        avoidLabelOverlap: true,
-        label: { color: '#30413b' },
-        data: mermaData,
-      }],
+      yAxis: {
+        type: 'category',
+        data: mermaData.map((item) => item.id_dim_insumo__nombre),
+        axisLabel: chartTextStyle,
+      },
+      series: [
+        {
+          name: 'Merma',
+          type: 'bar',
+          data: mermaData.map((item) => Number(item.cantidad || 0)),
+          itemStyle: { borderRadius: [0, 6, 6, 0] },
+        },
+        {
+          name: 'Perdida estimada',
+          type: 'bar',
+          data: mermaData.map((item) => Number(item.costo || 0)),
+          itemStyle: { borderRadius: [0, 6, 6, 0] },
+        },
+      ],
     };
-  }, [biData.merma_por_insumo]);
+  }, [mermaDashboardData.merma_por_insumo]);
   const metaVentasOption = useMemo(() => ({
     color: businessChartPalette,
     tooltip: tooltipStyle,
@@ -1018,9 +1096,12 @@ function App() {
         fontSize: 28,
         fontWeight: 900,
       },
-      data: [{ value: Number(Math.min(Number(kpiMeta?.valor || 0), 100).toFixed(1)), name: 'Cumplimiento' }],
+      data: [{
+        value: Number(Math.min(Number(cumplimientoMetaTemporal ?? kpiMeta?.valor ?? 0), 100).toFixed(1)),
+        name: 'Cumplimiento',
+      }],
     }],
-  }), [kpiMeta]);
+  }), [cumplimientoMetaTemporal, kpiMeta]);
   const costosOption = useMemo(() => ({
     color: ['#1f6f8b', '#c3423f'],
     tooltip: {
@@ -1071,8 +1152,8 @@ function App() {
   }), [biData.compras_mensual]);
 
   useEffect(() => {
-    // Recupera la sesion guardada al recargar la pagina.
-    const token = localStorage.getItem('token');
+    // Recupera solamente la sesion guardada en esta pestana.
+    const token = authSession.getToken();
 
     if (!token) {
       setCheckingSession(false);
@@ -1080,33 +1161,36 @@ function App() {
     }
 
     if (!navigator.onLine) {
-      const cachedUser = readOfflineUser();
+      const cachedUser = authSession.getUser();
       if (cachedUser) {
         setUsuario(cachedUser);
       } else {
-        localStorage.removeItem('token');
+        authSession.clear();
       }
       setCheckingSession(false);
       return;
     }
 
     // Si existe token guardado, se valida con el backend antes de mostrar la sesion.
+    let active = true;
     api
       .get('/usuarios/perfil/')
       .then(({ data }) => {
+        if (!active || !authSession.isCurrent(token)) return;
         setUsuario(data.usuario);
-        localStorage.setItem('chillamicito:offline-user', JSON.stringify(data.usuario));
+        authSession.setUser(data.usuario);
       })
       .catch((requestError) => {
-        const cachedUser = isNetworkFailure(requestError) ? readOfflineUser() : null;
+        if (!active || !authSession.isCurrent(token)) return;
+        const cachedUser = isNetworkFailure(requestError) ? authSession.getUser() : null;
         if (cachedUser) {
           setUsuario(cachedUser);
         } else {
-          localStorage.removeItem('token');
-          localStorage.removeItem('chillamicito:offline-user');
+          authSession.clear();
         }
       })
-      .finally(() => setCheckingSession(false));
+      .finally(() => { if (active) setCheckingSession(false); });
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
@@ -1181,7 +1265,7 @@ function App() {
   }, [usuario]);
 
   const applyStockResult = (result, token) => {
-    if (localStorage.getItem('token') !== token) return;
+    if (!authSession.isCurrent(token)) return;
     if ([401, 403].includes(result.failure?.response?.status)) {
       setOfflineMessage('La sesion o sus permisos cambiaron. Inicia sesion nuevamente.');
       if (result.failure.response.status === 401) handleLogout();
@@ -1207,7 +1291,7 @@ function App() {
 
   const refreshStock = async (retry = false) => {
     if (!usuario || refreshRunning.current) return null;
-    const token = localStorage.getItem('token');
+    const token = authSession.getToken();
     refreshRunning.current = true;
     setSyncingOffline(true);
     try {
@@ -1215,7 +1299,7 @@ function App() {
       applyStockResult(result, token);
       return result;
     } catch (requestError) {
-      if (localStorage.getItem('token') === token) setOfflineMessage(errorMessage(requestError));
+      if (authSession.isCurrent(token)) setOfflineMessage(errorMessage(requestError));
       return null;
     } finally {
       refreshRunning.current = false;
@@ -1239,10 +1323,10 @@ function App() {
   const loadStockView = async (moduleName) => {
     setModuleError('');
     try {
-      const token = localStorage.getItem('token');
+      const token = authSession.getToken();
       const result = await stockClient.sync(usuario, token);
       applyStockResult(result, token);
-      if (localStorage.getItem('token') !== token || [401, 403].includes(result.failure?.response?.status)) return;
+      if (!authSession.isCurrent(token) || [401, 403].includes(result.failure?.response?.status)) return;
       if (!result.data) throw new Error('Primero carga los datos con conexion.');
       setActiveModule(moduleName);
     } catch (requestError) {
@@ -1310,7 +1394,11 @@ function App() {
   const loadDisponibilidadModule = () => loadStockView('disponibilidad');
   const loadAlertasModule = () => loadStockView('alertas');
   const loadSalidaModule = () => loadStockView('salidas');
-  const loadMermaModule = () => loadStockView('mermas');
+  const biQueryParams = (filters, fields = Object.keys(filters)) => Object.fromEntries(
+    Object.entries(filters)
+      .filter(([key]) => fields.includes(key))
+      .filter(([, value]) => value !== '' && value !== 'todos'),
+  );
 
   const loadBiModule = async (moduleName) => {
     // Muestra el Data Mart ya cargado; el recalculo se ejecuta desde el boton Actualizar.
@@ -1321,6 +1409,9 @@ function App() {
       const dashboardResponse = await api.get('/usuarios/bi/dashboard/');
 
       setBiData(dashboardResponse.data);
+      setDemandaIndicatorData(null);
+      setTendenciaIndicatorData(null);
+      setMermaIndicatorData(null);
       setActiveModule(moduleName);
     } catch (requestError) {
       setModuleError(requestError.response?.data?.detail || 'No se pudo cargar la informacion BI.');
@@ -1338,6 +1429,9 @@ function App() {
       const dashboardResponse = await api.get('/usuarios/bi/dashboard/');
 
       setBiData(dashboardResponse.data);
+      setDemandaIndicatorData(null);
+      setTendenciaIndicatorData(null);
+      setMermaIndicatorData(null);
       setActiveModule(moduleName);
     } catch (requestError) {
       setModuleError(requestError.response?.data?.detail || 'No se pudo actualizar la informacion BI.');
@@ -1353,6 +1447,27 @@ function App() {
     } catch {
       setModuleError('No se pudo generar el PDF. Intenta nuevamente.');
     }
+  };
+
+  const applyIndicatorFilters = async (filters, fields, setIndicatorData, afterApply) => {
+    setModuleError('');
+    setModuleMessage('');
+    try {
+      const dashboardResponse = await api.get('/usuarios/bi/dashboard/', { params: biQueryParams(filters, fields) });
+      setIndicatorData(dashboardResponse.data);
+      afterApply?.();
+      setActiveModule('dashboards');
+    } catch (requestError) {
+      setModuleError(requestError.response?.data?.detail || 'No se pudo aplicar los filtros BI.');
+    }
+  };
+
+  const clearIndicatorFilters = (initialFilters, setFilters, setIndicatorData, afterClear) => {
+    setFilters(initialFilters);
+    setIndicatorData(null);
+    afterClear?.();
+    setModuleError('');
+    setModuleMessage('');
   };
 
   const loadFeriadosModule = async () => {
@@ -1383,15 +1498,14 @@ function App() {
   };
 
   const handleSubmit = async (event) => {
-    // Inicia sesion contra el backend y guarda el token localmente.
+    // Inicia sesion contra el backend y guarda la credencial en esta pestana.
     event.preventDefault();
     setError('');
     setLoading(true);
 
     try {
       const { data } = await api.post('/usuarios/login/', form);
-      localStorage.setItem('token', data.token);
-      localStorage.setItem('chillamicito:offline-user', JSON.stringify(data.usuario));
+      authSession.save(data.token, data.usuario);
       setUsuario(data.usuario);
       setForm(initialForm);
     } catch (requestError) {
@@ -1402,9 +1516,8 @@ function App() {
   };
 
   const handleLogout = () => {
-    // Limpia datos sensibles y regresa a la pantalla de login.
-    localStorage.removeItem('token');
-    localStorage.removeItem('chillamicito:offline-user');
+    // Cierra solamente la sesion de esta pestana y regresa al login.
+    authSession.clear();
     setUsuario(null);
     setPendingOperations(0);
     setOfflineErrors([]);
@@ -1419,6 +1532,13 @@ function App() {
     setNotificaciones([]);
     setFeriados([]);
     setBiData(initialBiData);
+    setDemandaFilters(initialDemandaFilters);
+    setTendenciaFilters(initialTendenciaFilters);
+    setMermaFilters(initialMermaFilters);
+    setDemandaIndicatorData(null);
+    setTendenciaIndicatorData(null);
+    setMermaIndicatorData(null);
+    setMetaVentasTemporal('');
     setSelectedRoleId('');
     setActiveModule('');
     setUserForm(initialUserForm);
@@ -1459,11 +1579,6 @@ function App() {
 
     if (action === 'Registrar salida') {
       loadSalidaModule();
-      return;
-    }
-
-    if (action === 'Registrar merma') {
-      loadMermaModule();
       return;
     }
 
@@ -1627,13 +1742,13 @@ function App() {
   };
 
   const saveMovement = async (kind, payload, setSaving, resetForm) => {
-    const token = localStorage.getItem('token');
+    const token = authSession.getToken();
     setSaving(true);
     setModuleError('');
     setModuleMessage('');
     try {
       const result = await stockClient.save(usuario, token, kind, payload);
-      if (localStorage.getItem('token') !== token) return;
+      if (!authSession.isCurrent(token)) return;
       applyStockResult(result, token);
       resetForm();
       setModuleMessage(result.operations.length
@@ -1648,10 +1763,38 @@ function App() {
 
   const handleSaveEntrada = async (event) => {
     event.preventDefault();
+    if (!entradaForm.hubo_merma) {
+      setModuleError('Debe indicar si hubo merma al recibir los insumos.');
+      return;
+    }
+    const mermas = [];
+    if (entradaForm.hubo_merma === 'si') {
+      const cantidadMerma = Number(entradaForm.merma_cantidad || 0);
+      if (cantidadMerma <= 0) {
+        setModuleError('La cantidad de merma debe ser mayor a cero.');
+        return;
+      }
+      if (cantidadMerma > entradaConvertida.cantidadKg) {
+        setModuleError('La merma no puede superar la cantidad ingresada del insumo.');
+        return;
+      }
+      if (!entradaForm.merma_observacion.trim()) {
+        setModuleError('Debe escribir una observacion para la merma.');
+        return;
+      }
+      mermas.push({
+        id_insumo: Number(entradaForm.id_insumo),
+        cantidad: Number(cantidadMerma.toFixed(3)),
+        observacion: entradaForm.merma_observacion.trim(),
+      });
+    }
     const observacion = [
       entradaForm.observacion,
       `Compra registrada: ${formatCantidad(entradaForm.cantidad_compra)} ${labelsCompra[entradaForm.tipo_compra]}(s)`,
       `Equivalencia: 1 ${labelsCompra[entradaForm.tipo_compra]} = ${entradaConvertida.factor} kg`,
+      entradaForm.hubo_merma === 'si'
+        ? `Merma declarada: ${formatCantidad(entradaForm.merma_cantidad)} kg`
+        : 'Sin merma declarada al recibir',
     ].filter(Boolean).join(' | ');
     await saveMovement('entrada', {
       observacion,
@@ -1660,6 +1803,7 @@ function App() {
         cantidad: Number(entradaConvertida.cantidadKg.toFixed(3)),
         costo_unitario: Number(entradaConvertida.costoUnitarioKg.toFixed(2)),
       }],
+      ...(mermas.length ? { mermas } : {}),
     }, setSavingEntrada, () => setEntradaForm(initialEntradaForm));
   };
 
@@ -1725,6 +1869,90 @@ function App() {
     }, setSavingMerma, () => setMermaForm(initialMermaForm));
   };
 
+  const renderBiFilterPanel = ({
+    fields,
+    filters,
+    setFilters,
+    onApply,
+    onClear,
+  }) => {
+    const handleChange = ({ target }) => {
+      setFilters((currentFilters) => ({
+        ...currentFilters,
+        [target.name]: target.value,
+      }));
+    };
+
+    return (
+    <div className="report-filter">
+      {fields.includes('fecha_inicio') && (
+        <label>
+          Fecha inicio
+          <input type="date" name="fecha_inicio" value={filters.fecha_inicio || ''} onChange={handleChange} />
+        </label>
+      )}
+      {fields.includes('fecha_fin') && (
+        <label>
+          Fecha fin
+          <input type="date" name="fecha_fin" value={filters.fecha_fin || ''} onChange={handleChange} />
+        </label>
+      )}
+      {fields.includes('periodo') && (
+        <label>
+          Periodo rápido
+          <select name="periodo" value={filters.periodo || ''} onChange={handleChange}>
+            <option value="">Todo</option>
+            <option value="dia">Día actual</option>
+            <option value="semana">Semana actual</option>
+            <option value="mes">Mes actual</option>
+            <option value="trimestre">Trimestre actual</option>
+          </select>
+        </label>
+      )}
+      {fields.includes('insumo') && (
+        <label>
+          Insumo
+          <select name="insumo" value={filters.insumo || ''} onChange={handleChange}>
+            <option value="">Todos</option>
+            {(insumos.length ? insumos : (biData.stock_actual || []).map((item) => ({ id_insumo: item.nombre, nombre: item.nombre }))).map((insumo) => (
+              <option key={insumo.id_insumo} value={insumo.nombre}>{insumo.nombre}</option>
+            ))}
+          </select>
+        </label>
+      )}
+      {fields.includes('plato') && (
+        <label>
+          Plato
+          <select name="plato" value={filters.plato || ''} onChange={handleChange}>
+            <option value="">Todos</option>
+            {Object.keys(recetasPorPlato).map((plato) => (
+              <option key={plato} value={plato}>{plato}</option>
+            ))}
+          </select>
+        </label>
+      )}
+      {fields.includes('tipo_dia') && (
+        <label>
+          Tipo de día
+          <select name="tipo_dia" value={filters.tipo_dia || 'todos'} onChange={handleChange}>
+            <option value="todos">Todos</option>
+            <option value="fin_semana">Fin de semana</option>
+            <option value="entre_semana">Entre semana</option>
+          </select>
+        </label>
+      )}
+      <span>
+        <button type="button" className="secondary-button compact" onClick={onApply}>
+          Aplicar filtros
+        </button>
+        <button type="button" className="secondary-button compact" onClick={onClear}>
+          Limpiar
+        </button>
+      </span>
+    </div>
+    );
+  };
+
   if (checkingSession) {
     // Pantalla breve mientras se valida si existe una sesion guardada.
     return (
@@ -1774,7 +2002,7 @@ function App() {
               {operation.kind}: {operation.error}
               {operation.canDiscard && <button type="button" onClick={async () => {
                 if (!window.confirm('Descartar este movimiento rechazado?')) return;
-                const token = localStorage.getItem('token');
+                const token = authSession.getToken();
                 try {
                   applyStockResult(await stockClient.discard(usuario, operation.id), token);
                   await refreshStock();
@@ -2047,6 +2275,44 @@ function App() {
                     Observacion
                     <textarea name="observacion" value={entradaForm.observacion} onChange={handleEntradaChange} />
                   </label>
+                  <label>
+                    ¿Hubo merma al recibir los insumos?
+                    <select name="hubo_merma" value={entradaForm.hubo_merma} onChange={handleEntradaChange} required>
+                      <option value="">Responder</option>
+                      <option value="no">No</option>
+                      <option value="si">Sí</option>
+                    </select>
+                  </label>
+                  {entradaForm.hubo_merma === 'si' && (
+                    <div className="conversion-preview">
+                      <span className="eyebrow">Merma detectada</span>
+                      <p className="stock-hint">
+                        La cantidad perdida se descontará del mismo insumo recibido.
+                      </p>
+                      <label>
+                        Cantidad de merma kg
+                        <input
+                          min="0.001"
+                          max={entradaConvertida.cantidadKg || undefined}
+                          name="merma_cantidad"
+                          step="0.001"
+                          type="number"
+                          value={entradaForm.merma_cantidad}
+                          onChange={handleEntradaChange}
+                          required
+                        />
+                      </label>
+                      <label>
+                        Observación de merma
+                        <textarea
+                          name="merma_observacion"
+                          value={entradaForm.merma_observacion}
+                          onChange={handleEntradaChange}
+                          required
+                        />
+                      </label>
+                    </div>
+                  )}
                   {selectedInsumo && (
                     <p className="stock-hint">
                       Stock actual: {formatCantidad(selectedInsumo.cantidad_actual)} {selectedInsumo.unidad_abreviatura || selectedInsumo.unidad}
@@ -2490,7 +2756,8 @@ function App() {
                       </span>
                       <span>
                         Merma
-                        <strong>{formatMoney(item.costoMerma)}</strong>
+                        <strong>{formatCantidad(item.mermaKg)} kg</strong>
+                        <small>{formatMoney(item.costoMerma)}</small>
                       </span>
                     </div>
                   </article>
@@ -2702,6 +2969,23 @@ function App() {
                     <h3>Demanda promedio por dia y franja horaria</h3>
                     <small>Identifica los horarios que requieren mayor preparacion previa.</small>
                   </div>
+                  {renderBiFilterPanel({
+                    fields: ['plato', 'tipo_dia'],
+                    filters: demandaFilters,
+                    setFilters: setDemandaFilters,
+                    onApply: () => applyIndicatorFilters(
+                      demandaFilters,
+                      ['plato', 'tipo_dia'],
+                      setDemandaIndicatorData,
+                      () => setSelectedDemandIndex(0),
+                    ),
+                    onClear: () => clearIndicatorFilters(
+                      initialDemandaFilters,
+                      setDemandaFilters,
+                      setDemandaIndicatorData,
+                      () => setSelectedDemandIndex(0),
+                    ),
+                  })}
                   <BiChart
                     height={310}
                     onEvents={{
@@ -2730,6 +3014,21 @@ function App() {
                     <h3>Variacion y tendencia de ventas/consumo</h3>
                     <small>Compara ventas estimadas contra consumo de insumos para decidir si ajustar compras y produccion.</small>
                   </div>
+                  {renderBiFilterPanel({
+                    fields: ['fecha_inicio', 'fecha_fin', 'tipo_dia', 'plato'],
+                    filters: tendenciaFilters,
+                    setFilters: setTendenciaFilters,
+                    onApply: () => applyIndicatorFilters(
+                      tendenciaFilters,
+                      ['fecha_inicio', 'fecha_fin', 'tipo_dia', 'plato'],
+                      setTendenciaIndicatorData,
+                    ),
+                    onClear: () => clearIndicatorFilters(
+                      initialTendenciaFilters,
+                      setTendenciaFilters,
+                      setTendenciaIndicatorData,
+                    ),
+                  })}
                   <BiChart option={tendenciaVentasOption} height={340} />
                   <div className="decision-reading">
                     <strong>{ultimaTendencia ? tendenciaTexto(ultimaTendencia.variacion_ventas, ultimaTendencia.estado_tendencia) : 'Sin tendencia suficiente'}</strong>
@@ -2772,10 +3071,25 @@ function App() {
                     <h3>Merma por insumo</h3>
                     <small>Controla perdidas por deterioro, manipulacion o ajustes manuales.</small>
                   </div>
+                  {renderBiFilterPanel({
+                    fields: ['fecha_inicio', 'fecha_fin', 'periodo', 'insumo', 'tipo_dia'],
+                    filters: mermaFilters,
+                    setFilters: setMermaFilters,
+                    onApply: () => applyIndicatorFilters(
+                      mermaFilters,
+                      ['fecha_inicio', 'fecha_fin', 'periodo', 'insumo', 'tipo_dia'],
+                      setMermaIndicatorData,
+                    ),
+                    onClear: () => clearIndicatorFilters(
+                      initialMermaFilters,
+                      setMermaFilters,
+                      setMermaIndicatorData,
+                    ),
+                  })}
                   <BiChart option={mermaOption} height={310} />
                   <div className="decision-reading">
                     <strong>{formatCantidad(totalMermaKg)} kg | {formatMoney(totalMermaCosto)}</strong>
-                    <small>{kpiMerma?.decision || 'Sin mermas registradas en el periodo.'}</small>
+                    <small>{kpiMermaIndicador?.decision || 'Sin mermas registradas en el periodo.'}</small>
                   </div>
                 </section>
 
@@ -2783,12 +3097,36 @@ function App() {
                   <div>
                     <span className="eyebrow">Indicador 7</span>
                     <h3>Cumplimiento de meta de ventas</h3>
-                    <small>Compara las ventas del ultimo mes registrado contra la meta mensual estimada.</small>
+                    <small>Compara las ventas del ultimo mes registrado contra una meta estimada o manual.</small>
                   </div>
+                  <label>
+                    Meta mensual manual
+                    <input
+                      min="0"
+                      name="meta_ventas_temporal"
+                      step="0.01"
+                      type="number"
+                      value={metaVentasTemporal}
+                      onChange={(event) => setMetaVentasTemporal(event.target.value)}
+                      placeholder="Opcional. Ej. 140000"
+                    />
+                  </label>
                   <BiChart option={metaVentasOption} height={310} />
                   <div className="decision-reading">
-                    <strong>{kpiMeta?.lectura || 'Sin meta calculada.'}</strong>
-                    <small>{kpiMeta?.decision || 'Registrar ventas para comparar cumplimiento.'}</small>
+                    <strong>
+                      {cumplimientoMetaTemporal === null
+                        ? (kpiMeta?.lectura || 'Ingresa una meta para comparar.')
+                        : `${cumplimientoMetaTemporal.toFixed(1)}% cumplido; faltan ${formatMoney(faltanteMetaTemporal)}.`}
+                    </strong>
+                    <small>
+                      {cumplimientoMetaTemporal === null
+                        ? (kpiMeta?.decision || 'Registrar ventas para comparar cumplimiento.')
+                        : estadoMetaTemporal === 'normal'
+                          ? 'Meta en buen nivel de cumplimiento.'
+                          : estadoMetaTemporal === 'preventivo'
+                            ? 'La meta esta cerca, conviene reforzar dias de mayor demanda.'
+                            : 'La meta esta lejos, revisar ventas, stock disponible y platos con mayor salida.'}
+                    </small>
                   </div>
                 </section>
 
@@ -2819,28 +3157,6 @@ function App() {
                   </div>
                 </section>
 
-                <section className="powerbi-visual">
-                  <div>
-                    <span className="eyebrow">Analisis complementario</span>
-                    <h3>Estimacion del proximo mes</h3>
-                    <small>Calcula una referencia futura usando el promedio de los ultimos meses disponibles.</small>
-                  </div>
-                  <div className="projection-grid">
-                    <span>
-                      Ventas estimadas
-                      <strong>{formatMoney(analisisComplementarios.proyeccion_proximo_mes?.ventas_estimadas)}</strong>
-                    </span>
-                    <span>
-                      Ganancia estimada
-                      <strong>{formatMoney(analisisComplementarios.proyeccion_proximo_mes?.ganancia_estimada)}</strong>
-                    </span>
-                    <small>{analisisComplementarios.proyeccion_proximo_mes?.metodo || 'Sin datos historicos.'}</small>
-                  </div>
-                  <div className="analysis-reading">
-                    <strong>{analisisComplementarios.proyeccion_proximo_mes?.lectura || 'Sin lectura de proyeccion.'}</strong>
-                    <small>{analisisComplementarios.proyeccion_proximo_mes?.decision || 'Registrar mas ventas para generar una decision.'}</small>
-                  </div>
-                </section>
               </div>
             </section>
           ) : activeModule === 'mermas' ? (

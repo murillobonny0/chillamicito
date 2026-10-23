@@ -91,7 +91,11 @@ def ejecutar_etl_movimientos_stock():
 
             registro.estado = RegistroETL.Estado.EJECUTADO
             registro.descripcion = (
-                'ETL Python ejecutado correctamente. '
+                'ETL Python ejecutado correctamente mediante recarga completa controlada del Data Mart. '
+                'Extraccion de entradas, salidas y mermas; limpieza de cantidades invalidas; '
+                'ordenamiento cronologico; transformacion a dimensiones de categoria, insumo, tiempo, '
+                'usuario y tipo de movimiento; calculo de costo promedio ponderado, stock resultante, '
+                'costo de salidas y costo de mermas. '
                 f"Entradas: {resultado['entradas']}; salidas: {resultado['salidas']}; "
                 f"mermas: {resultado['mermas']}; "
                 f"movimientos cargados: {resultado['movimientos']}. "
@@ -212,6 +216,8 @@ def _cargar_movimientos_cronologicos(tipo_entrada, tipo_salida, tipo_merma):
             continue
 
         costo_unitario = costo_promedio_actual.get(insumo_id, Decimal('0'))
+        if origen == 'merma':
+            costo_unitario = _costo_unitario_merma(detalle, costo_unitario)
         if costo_unitario == 0:
             salidas_sin_costo += 1
 
@@ -278,6 +284,25 @@ def _actualizar_costeo_por_entrada(stock_previo, costo_previo, detalle):
         costo_promedio = detalle.costo_unitario
 
     return stock_nuevo, costo_promedio
+
+
+def _costo_unitario_merma(merma, costo_promedio):
+    """Usa el precio de la entrada cuando la merma se registro al recibir."""
+    if merma.motivo == 'Recepción':
+        detalle = (
+            DetalleEntrada.objects
+            .filter(
+                id_entrada__fecha_entrada=merma.fecha_merma,
+                id_entrada__id_usuario=merma.id_usuario,
+                id_insumo=merma.id_insumo,
+            )
+            .order_by('-id_detalle_entrada')
+            .first()
+        )
+        if detalle:
+            return detalle.costo_unitario or Decimal('0')
+
+    return costo_promedio
 
 
 def _construir_hecho_entrada(

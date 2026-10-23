@@ -1,3 +1,5 @@
+import { authSession } from './authSession.js';
+
 export const isNetworkFailure = (error) => Boolean(error?.isAxiosError && !error.response && error.code !== 'ERR_CANCELED');
 
 export function errorMessage(error) {
@@ -52,10 +54,23 @@ export function createOperation(user, kind, payload, insumos) {
       throw new Error('El costo no puede ser negativo.');
     }
   }
+  const entryLosses = kind === 'entrada' ? (payload.mermas || []) : [];
+  const lossTotals = new Map();
+  for (const loss of entryLosses) {
+    const cantidad = Number(loss.cantidad);
+    if (!Number.isFinite(cantidad) || cantidad <= 0) throw new Error('La cantidad de merma debe ser mayor a cero.');
+    if (!String(loss.observacion || '').trim()) throw new Error('La observacion de merma es obligatoria.');
+    lossTotals.set(Number(loss.id_insumo), (lossTotals.get(Number(loss.id_insumo)) || 0) + cantidad);
+  }
+  for (const [insumoId, cantidad] of lossTotals) {
+    if (!totals.has(insumoId)) throw new Error('La merma debe corresponder al insumo recibido.');
+    if (cantidad > totals.get(insumoId)) throw new Error('La merma no puede superar la cantidad ingresada.');
+  }
   for (const [insumoId, cantidad] of totals) {
     const insumo = insumos.find((item) => Number(item.id_insumo) === insumoId);
     if (!insumo) throw new Error('El insumo no esta disponible en los datos locales.');
-    const remaining = Math.round((Number(insumo.cantidad_actual) - cantidad) * 1000);
+    const netEntry = kind === 'entrada' ? cantidad - (lossTotals.get(insumoId) || 0) : -cantidad;
+    const remaining = Math.round((Number(insumo.cantidad_actual) + netEntry) * 1000);
     const minimum = kind === 'salida' ? Math.round(Number(insumo.stock_minimo) * 1000) : 0;
     if (kind !== 'entrada' && remaining < minimum) throw new Error(`Stock insuficiente para ${insumo.nombre}.`);
   }
@@ -70,7 +85,12 @@ export function createOperation(user, kind, payload, insumos) {
   return {
     id, userId: String(user.id_usuario), kind, createdAt, status: 'pending',
     endpoint: `/usuarios/stock/${kind}s/`, payload: { ...payload, id_operacion: id, fecha_operacion: createdAt },
-    stockDeltas: [...totals].map(([id_insumo, cantidad]) => ({ id_insumo, cantidad: kind === 'entrada' ? cantidad : -cantidad })),
+    stockDeltas: [
+      ...[...totals].map(([id_insumo, cantidad]) => ({
+        id_insumo,
+        cantidad: kind === 'entrada' ? cantidad - (lossTotals.get(id_insumo) || 0) : -cantidad,
+      })),
+    ],
     record: {
       ...payload, [`id_${kind}`]: id, id_operacion: id, [`fecha_${kind}`]: createdAt,
       usuario: user.username, pendiente: true,
@@ -80,7 +100,7 @@ export function createOperation(user, kind, payload, insumos) {
   };
 }
 
-export function createStockClient(api, storage) {
+export function createStockClient(api, storage, session = authSession) {
   let chain = Promise.resolve();
   const locked = (user, action) => {
     const run = () => globalThis.navigator?.locks
@@ -89,7 +109,7 @@ export function createStockClient(api, storage) {
     chain = result.catch(() => undefined);
     return result;
   };
-  const current = (token) => localStorage.getItem('token') === token;
+  const current = (token) => session.isCurrent(token);
   const requestConfig = (token) => ({ headers: { Authorization: `Token ${token}` } });
   const fetchSnapshot = async (user, token) => {
     const names = ['insumos', 'notificaciones'];

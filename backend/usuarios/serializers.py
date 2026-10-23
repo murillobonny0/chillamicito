@@ -214,6 +214,14 @@ class DetalleEntradaSerializer(serializers.ModelSerializer):
         return obj.cantidad * obj.costo_unitario
 
 
+class MermaEntradaSerializer(serializers.Serializer):
+    """Datos de perdida detectada al registrar una entrada."""
+
+    id_insumo = serializers.PrimaryKeyRelatedField(queryset=Insumo.objects.filter(estado=True))
+    cantidad = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=Decimal('0.001'))
+    observacion = serializers.CharField(allow_blank=False, trim_whitespace=True)
+
+
 class MovimientoSerializer(serializers.ModelSerializer):
     fecha_operacion = serializers.DateTimeField(required=False, write_only=True)
 
@@ -228,6 +236,7 @@ class EntradaSerializer(MovimientoSerializer):
 
     usuario = serializers.CharField(source='id_usuario.username', read_only=True)
     detalles = DetalleEntradaSerializer(many=True)
+    mermas = MermaEntradaSerializer(many=True, required=False, write_only=True)
     total_compra = serializers.SerializerMethodField()
 
     class Meta:
@@ -241,6 +250,7 @@ class EntradaSerializer(MovimientoSerializer):
             'usuario',
             'observacion',
             'detalles',
+            'mermas',
             'total_compra',
         ]
         read_only_fields = ['id_entrada', 'fecha_entrada', 'id_usuario', 'usuario']
@@ -255,10 +265,33 @@ class EntradaSerializer(MovimientoSerializer):
             raise serializers.ValidationError('Debe registrar al menos un insumo.')
         return value
 
+    def validate(self, attrs):
+        """Valida que la merma declarada corresponda a los insumos recibidos."""
+        attrs = super().validate(attrs)
+        detalles = attrs.get('detalles', [])
+        mermas = attrs.get('mermas') or []
+
+        cantidades_recibidas = {}
+        for detalle in detalles:
+            insumo = detalle['id_insumo']
+            cantidades_recibidas[insumo.pk] = cantidades_recibidas.get(insumo.pk, Decimal('0')) + detalle['cantidad']
+
+        cantidades_merma = {}
+        for merma in mermas:
+            insumo = merma['id_insumo']
+            if insumo.pk not in cantidades_recibidas:
+                raise serializers.ValidationError('La merma debe corresponder a un insumo incluido en la entrada.')
+            cantidades_merma[insumo.pk] = cantidades_merma.get(insumo.pk, Decimal('0')) + merma['cantidad']
+            if cantidades_merma[insumo.pk] > cantidades_recibidas[insumo.pk]:
+                raise serializers.ValidationError('La merma no puede superar la cantidad recibida del insumo.')
+
+        return attrs
+
     @transaction.atomic
     def create(self, validated_data):
         """Guarda la entrada completa y aumenta el stock de cada insumo."""
         detalles = validated_data.pop('detalles')
+        mermas = validated_data.pop('mermas', [])
         fecha = validated_data.pop('fecha_operacion', timezone.now())
         entrada = Entrada.objects.create(
             fecha_entrada=fecha,
@@ -272,6 +305,22 @@ class EntradaSerializer(MovimientoSerializer):
             # Aqui se guarda la cantidad comprada: cada detalle de entrada suma al stock actual.
             stock.cantidad_actual += detalle.cantidad
             stock.save(update_fields=['cantidad_actual', 'fecha_actualizacion'])
+
+        for merma_data in mermas:
+            merma = Merma.objects.create(
+                fecha_merma=fecha,
+                id_usuario=self.context['request'].user,
+                id_insumo=merma_data['id_insumo'],
+                cantidad=merma_data['cantidad'],
+                motivo='Recepción',
+                observacion=merma_data['observacion'],
+            )
+            stock, _ = Stock.objects.get_or_create(id_insumo=merma.id_insumo)
+            if merma.cantidad > stock.cantidad_actual:
+                raise serializers.ValidationError('La merma no puede ser mayor al stock actual.')
+            stock.cantidad_actual -= merma.cantidad
+            stock.save(update_fields=['cantidad_actual', 'fecha_actualizacion'])
+            evaluar_stock_insumo(merma.id_insumo)
 
         transaction.on_commit(lambda: enviar_movimiento_stock(entrada, 'entrada'), robust=True)
         return entrada
@@ -398,8 +447,8 @@ class MermaSerializer(MovimientoSerializer):
 
     def validate_motivo(self, value):
         """Mantiene el registro de merma enfocado en recortes de produccion."""
-        if value != 'Recorte':
-            raise serializers.ValidationError('El registro de merma solo permite el motivo Recorte.')
+        if value not in ['Recorte', 'Recepción']:
+            raise serializers.ValidationError('El registro de merma solo permite los motivos Recorte o Recepción.')
         return value
 
     def validate(self, attrs):
